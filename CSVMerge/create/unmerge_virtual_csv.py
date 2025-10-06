@@ -79,5 +79,5 @@ for file_name in csv_files:
 # done_unmerge.txt schreiben
 with open(done_unmerge_path, "w", encoding="utf-8") as f_done:
     f_done.write("\n".join(reconstructed_files))
-
+# Datei erstellen 
 print(f"📄 unmergeDone.txt erstellt: {done_unmerge_path}")
