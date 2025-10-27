@@ -1,25 +1,21 @@
 ﻿import os
 import csv
 import re
+import json
 
-# Ordnerpfade
+# Pfade
 input_dir = r"D:\CSVMerge\30_unmergeVirtualCSV"
 output_dir = r"D:\CSVMerge\40_unmergedCSVs"
 temp_dir = r"D:\CSVMerge\temp"
 done_unmerge_path = os.path.join(temp_dir, "unmergeDone.txt")
 encoding = "utf-8"
+delimiter = ";"
 
-# Zielordner sicherstellen
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(temp_dir, exist_ok=True)
 
+# ---------- Helfer ----------
 def extract_text_value(s: str) -> str:
-    """
-    Entfernt typische Excel-/CSV-Konstrukte:
-    - ="0050" -> 0050
-    - '0050   -> 0050 (Excel-Text-Präfix)
-    - Trimmt Whitespace
-    """
     if s is None:
         return ""
     s = str(s).strip()
@@ -30,71 +26,85 @@ def extract_text_value(s: str) -> str:
     return s.strip()
 
 def normalize_op_number(v: str) -> str:
-    """
-    Macht die Arbeitsvorgangsnummer wieder vierstellig (nur wenn es rein numerisch ist).
-    Beispiele:
-    - "50" -> "0050"
-    - "0050" -> "0050"
-    - "A010" -> "A010" (unverändert, da nicht rein numerisch)
-    """
     v = extract_text_value(v)
     return v.zfill(4) if v.isdigit() else v
 
-def safe_get(row, idx):
-    """Sichere Index-Abfrage auf Zeilenliste."""
-    return row[idx] if idx < len(row) else ""
+def to_float_or_none(s):
+    if s is None:
+        return None
+    s = extract_text_value(s).replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-def sanitize_filename(name: str, max_len: int = 150) -> str:
-    """
-    Entfernt unzulässige Zeichen für Dateinamen unter Windows und kürzt ggf.
-    """
-    name = extract_text_value(name)
-    # Ersetze verbotene Zeichen
-    name = re.sub(r'[<>:"/\\|?*]', '_', name)
-    # Entferne führende/trailing Punkte/Spaces (Windows-Sonderfall)
-    name = name.strip(' .')
-    if not name:
-        name = "unmerged"
-    # Länge begrenzen
-    if len(name) > max_len:
-        name = name[:max_len]
-    return name
+def fmt_num(x: float) -> str:
+    return str(int(x)) if float(x).is_integer() else str(x)
 
-# Alle CSV-Dateien im Eingangsordner verarbeiten
+def is_zeitbaustein_row(cells):
+    return any(str(c).strip().upper() == "ZEITBAUSTEIN" for c in cells)
+
+def find_merkmal_code(cells):
+    for c in cells:
+        m = re.search(r"\bV0\d{3}(?:\.\d{3})?\b", str(c).strip(), flags=re.IGNORECASE)
+        if m:
+            return m.group(0).upper()
+    return None
+
+def make_row_key(cells, sap_len):
+    parts = []
+    for i in range(min(sap_len, len(cells))):
+        t = str(cells[i]).strip()
+        if t and to_float_or_none(t) is None:
+            parts.append(t.upper())
+    return "||".join(parts)
+
+# ---------- Start ----------
 csv_files = [f for f in os.listdir(input_dir) if f.lower().endswith(".csv")]
 if not csv_files:
     print("⚠️ Keine CSV-Dateien im Eingangsordner gefunden.")
     raise SystemExit
 
-# Liste für wiederhergestellte Dateinamen (für unmergeDone.txt)
 reconstructed_files = []
 
 for file_name in csv_files:
     input_path = os.path.join(input_dir, file_name)
 
+    # Sidecar laden (muss zum Dateinamen passen)
+    sidecar_path = os.path.join(temp_dir, f"rawstore_{file_name}.json")
+    if not os.path.isfile(sidecar_path):
+        print(f"❌ Sidecar nicht gefunden für {file_name}: {sidecar_path}")
+        # Du kannst hier 'continue' machen oder ohne Restore arbeiten:
+        # continue
+    sidecar = None
+    if os.path.isfile(sidecar_path):
+        with open(sidecar_path, "r", encoding="utf-8") as jf:
+            sidecar = json.load(jf)
+    side_data = sidecar["data"] if sidecar else {}
+    sap_len_from_sidecar = sidecar.get("sap_header_len", None) if sidecar else None
+
+    # Merge-CSV lesen
     try:
         with open(input_path, encoding=encoding, newline="") as f:
-            reader = list(csv.reader(f, delimiter=";"))
+            rows = list(csv.reader(f, delimiter=delimiter))
     except Exception as e:
         print(f"❌ Datei {file_name} konnte nicht gelesen werden: {e}")
         continue
 
-    if len(reader) < 6:
+    if len(rows) < 6:
         print(f"⚠️ Datei {file_name} ist zu kurz – übersprungen.")
-        # Ursprungsdatei optional löschen:
         try:
             os.remove(input_path)
             print(f"🗑️ Datei gelöscht (zu kurz): {input_path}")
         except Exception as e:
-            print(f"❌ Fehler beim Löschen der Datei {input_path}: {e}")
+            print(f"❌ Fehler beim Löschen: {e}")
         continue
 
-    # Struktur: 4 Metazeilen, 1 Headerzeile, ab dann Datenzeilen
-    meta_lines = reader[:4]
-    header_line = reader[4]
-    data_rows = reader[5:]
+    meta_lines = rows[:4]
+    header_line = rows[4]
+    data_rows = rows[5:]
 
-    # Zusatzspalten finden
+    # Indizes: FA-Spalten
     try:
         f1_idx = header_line.index("Fertigungsauftrag_1")
         f2_idx = header_line.index("Fertigungsauftrag_2")
@@ -105,87 +115,91 @@ for file_name in csv_files:
             os.remove(input_path)
             print(f"🗑️ Datei gelöscht (falsches Format): {input_path}")
         except Exception as e:
-            print(f"❌ Fehler beim Löschen der Datei {input_path}: {e}")
+            print(f"❌ Fehler beim Löschen: {e}")
         continue
 
-    # Datencontainer: bis zu 3 rekonstruierte Dateien
+    sap_len = f1_idx if sap_len_from_sidecar is None else sap_len_from_sidecar
+    base_header = header_line[:f1_idx]
+
+    def row_bucket(row):
+        for i, idx in enumerate([f1_idx, f2_idx, f3_idx]):
+            if idx < len(row) and extract_text_value(row[idx]):
+                return i
+        return None
+
     output_data = {0: [], 1: [], 2: []}
-    auftrag_names = ["", "", ""]  # Dateinamen-Basis aus FA-Spalten
+    auftrag_names = ["", "", ""]
 
-    # Datenzeilen aufteilen (erste gefüllte FA-Spalte gewinnt)
-    fa_indices = [f1_idx, f2_idx, f3_idx]
+    for r in data_rows:
+        if len(r) <= f1_idx:
+            r = r + [""] * (f1_idx + 1 - len(r))
 
-    for row in data_rows:
-        # Robustheit: padde Zeile bis mindestens f1_idx Länge
-        if len(row) <= f1_idx:
-            row = row + [""] * (f1_idx + 1 - len(row))
-
-        target_bucket = None
-        bucket_name = ""
-
-        for i, f_idx in enumerate(fa_indices):
-            val = extract_text_value(safe_get(row, f_idx))
-            if val:  # erste gefüllte FA-Spalte
-                target_bucket = i
-                bucket_name = val
-                break
-
-        if target_bucket is None:
-            # Zeile ohne FA-Markierung – kann vorkommen; dann ignorieren oder einer Default-Gruppe zuordnen
-            # Hier: ignorieren (alternativ: output_data[0].append(...))
+        b = row_bucket(r)
+        if b is None:
             continue
 
-        # Originaldaten links der ersten FA-Spalte
-        orig_row = row[:f1_idx]
+        # Dateiname aus FA-Spalte
+        fa_name = extract_text_value(r[[f1_idx, f2_idx, f3_idx][b]])
+        if not auftrag_names[b]:
+            name = re.sub(r'[<>:"/\\|?*]', "_", fa_name).strip(" .") or "unmerged"
+            auftrag_names[b] = name
 
-        # 1. Spalte (SAP-OPS-Nummer) vierstellig normalisieren
+        # SAP-Teil
+        orig_row = r[:f1_idx]
+
+        # 1) OP-Nummer 4-stellig
         if orig_row:
             orig_row[0] = normalize_op_number(orig_row[0])
 
-        output_data[target_bucket].append(orig_row)
+        # 2) Zeitbaustein exakt wiederherstellen (aus Sidecar)
+        if side_data and is_zeitbaustein_row(orig_row):
+            key = make_row_key(orig_row, sap_len)
+            entry = side_data.get(key)
+            if entry:
+                # passenden Auftrag holen
+                raw_map = entry.get("raw", {})
+                raw_val = raw_map.get(str(b), None)  # falls als str gespeichert
+                if raw_val is None:
+                    raw_val = raw_map.get(b, None)
+                if raw_val is not None:
+                    # Zeitwertzelle (rechte numerische im SAP-Teil) setzen
+                    val_idx = None
+                    for i in range(len(orig_row) - 1, -1, -1):
+                        if to_float_or_none(orig_row[i]) is not None:
+                            val_idx = i
+                            break
+                    if val_idx is not None:
+                        try:
+                            rv = float(raw_val)
+                            orig_row[val_idx] = fmt_num(rv)
+                        except Exception:
+                            # falls im Sidecar als String liegt, einfach übernehmen
+                            orig_row[val_idx] = str(raw_val)
 
-        # Dateiname merken/säubern
-        if not auftrag_names[target_bucket]:
-            auftrag_names[target_bucket] = sanitize_filename(bucket_name)
+        output_data[b].append(orig_row)
 
-    # Schreiben der wiederhergestellten Einzeldateien
-    any_output = False
+    # Schreiben je Auftrag
     for i in range(3):
-        rows = output_data[i]
         name = auftrag_names[i]
-        if name and rows:
-            output_file = os.path.join(output_dir, f"{name}.csv")
+        rows_out = output_data[i]
+        if name and rows_out:
+            out_path = os.path.join(output_dir, f"{name}.csv")
+            with open(out_path, "w", encoding=encoding, newline="") as f_out:
+                w = csv.writer(f_out, delimiter=delimiter)
+                w.writerows(meta_lines)
+                w.writerow(base_header)
+                w.writerows(rows_out)
+            reconstructed_files.append(name)
+            print(f"✅ Datei wiederhergestellt: {out_path}")
 
-            # Header ohne Zusatzspalten (alles links von Fertigungsauftrag_1)
-            base_header = header_line[:f1_idx]
-
-            try:
-                with open(output_file, "w", encoding=encoding, newline="") as f_out:
-                    writer = csv.writer(f_out, delimiter=";")
-                    # Metazeilen unverändert
-                    writer.writerows(meta_lines)
-                    # Ursprünglichen Header ohne Merge-Zusatzspalten
-                    writer.writerow(base_header)
-                    # Datenzeilen (erste Spalte bereits normalisiert)
-                    writer.writerows(rows)
-
-                reconstructed_files.append(name)
-                any_output = True
-                print(f"✅ Datei wiederhergestellt: {output_file}")
-            except Exception as e:
-                print(f"❌ Fehler beim Schreiben {output_file}: {e}")
-
-    # Ursprungsdatei löschen (auch wenn keine Outputs entstanden sind, analog zu eurer bisherigen Logik)
+    # Eingabe löschen
     try:
         os.remove(input_path)
         print(f"🗑️ Datei gelöscht: {input_path}")
     except Exception as e:
         print(f"❌ Fehler beim Löschen der Datei {input_path}: {e}")
 
-# done_unmerge.txt schreiben
-try:
-    with open(done_unmerge_path, "w", encoding="utf-8", newline="") as f_done:
-        f_done.write("\n".join(reconstructed_files))
-    print(f"📄 unmergeDone.txt erstellt: {done_unmerge_path}")
-except Exception as e:
-    print(f"❌ Fehler beim Schreiben von {done_unmerge_path}: {e}")
+# done_unmerge.txt
+with open(done_unmerge_path, "w", encoding="utf-8", newline="") as f_done:
+    f_done.write("\n".join(reconstructed_files))
+print(f"📄 unmergeDone.txt erstellt: {done_unmerge_path}")
