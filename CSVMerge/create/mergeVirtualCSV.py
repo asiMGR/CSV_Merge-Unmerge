@@ -1,211 +1,194 @@
-import os
-import csv
-import re
-import json
+import os, csv, re, json, hashlib
+from pathlib import Path
 from datetime import datetime
 
-# === Pfade / Einstellungen ====================================================
-input_dir = r"D:\CSVMerge\10_createVirtualCSV"
-output_dir = r"D:\CSVMerge\20_VirtualCSVToSQL"
-temp_dir = r"D:\CSVMerge\temp"
-done_file_path = os.path.join(temp_dir, "done.txt")
-encoding_read = "latin1"
+# ===== Pfade =====
+base = Path(r"D:\CSVMerge")
+input_dir  = base / "10_createVirtualCSV"
+output_dir = base / "20_VirtualCSVToSQL"
+temp_dir   = base / "temp"
+done_file  = temp_dir / "done.txt"
+
+encoding_read  = "latin1"
 encoding_write = "utf-8"
 delimiter = ';'
 
-os.makedirs(output_dir, exist_ok=True)
-os.makedirs(temp_dir, exist_ok=True)
+output_dir.mkdir(parents=True, exist_ok=True)
+temp_dir.mkdir(parents=True, exist_ok=True)
+input_dir.mkdir(parents=True, exist_ok=True)
 
-# === Helfer ===================================================================
+# ===== Helfer (mit Unmerge identisch halten) =====
+_ws_re = re.compile(r"\s+")
 def to_float_or_none(s):
-    if s is None:
-        return None
+    if s is None: return None
     s = str(s).strip().replace(',', '.')
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
+    try: return float(s)
+    except ValueError: return None
+def norm_text(t: str) -> str:
+    t = str(t).strip().upper()
+    t = _ws_re.sub(" ", t)
+    return t
 def find_merkmal_code(cells):
     for c in cells:
         m = re.search(r'\bV0\d{3}(?:\.\d{3})?\b', str(c).strip(), flags=re.IGNORECASE)
-        if m:
-            return m.group(0).upper()
+        if m: return m.group(0).upper()
     return None
-
 def is_zeitbaustein_row(cells):
     return any(str(c).strip().upper() == 'ZEITBAUSTEIN' for c in cells)
-
-def rightmost_numeric_index(cells):
-    for i in range(len(cells) - 1, -1, -1):
+def rightmost_time_index(cells):
+    units = {"IM", "MIN", "MINUTEN"}
+    for i in range(len(cells)-1, 0, -1):
+        if to_float_or_none(cells[i]) is not None and norm_text(cells[i-1]) in units:
+            return i
+    for i in range(len(cells)-1, -1, -1):
         if to_float_or_none(cells[i]) is not None:
             return i
     return None
-
-def is_09xx(merkmal_code):
-    if not merkmal_code:
-        return False
-    m = re.match(r'V0(\d{3})', merkmal_code, flags=re.IGNORECASE)
+def is_09xx(code):
+    if not code: return False
+    m = re.match(r'V0(\d{3})', code, flags=re.IGNORECASE)
     return bool(m and 900 <= int(m.group(1)) <= 999)
-
 def make_row_key(cells, sap_len):
-    """
-    Stabiler Schlüssel pro ZEITBAUSTEIN-Zeile:
-    - nutzt alle NICHT-numerischen Zellen links vom ersten FA-Block (SAP-Teil)
-    - Groß-/Kleinschreibung egal, Whitespace getrimmt
-    Dadurch bleibt der Key identisch, auch wenn der Zahlenwert (rechts) summiert/maximiert wurde.
-    """
     parts = []
-    for i in range(min(sap_len, len(cells))):
-        t = str(cells[i]).strip()
-        if t and to_float_or_none(t) is None:
-            parts.append(t.upper())
+    upto = min(sap_len, len(cells))
+    for i in range(upto):
+        raw = str(cells[i])
+        if raw and to_float_or_none(raw) is None:
+            parts.append(norm_text(raw))
     return "||".join(parts)
 
-# === Sammellisten =============================================================
-all_rows = []
-done_fertigungsauftraege = []
-meta_lines_first = []
-sap_header = []
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-
-csv_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.csv')])
+# ===== Einlesen =====
+csv_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(".csv")])
 if not csv_files:
-    print("⚠️ Keine CSV-Dateien im Quellordner gefunden.")
-    raise SystemExit
+    raise SystemExit(f"⚠️ Keine CSV-Dateien in {input_dir}")
 
-staging_rows = []   # {row_pad, file_index, fa_value}
-first_file_seen = False
+datasets = []
+for name in csv_files[:3]:  # max 3
+    p = input_dir / name
+    with open(p, encoding=encoding_read, newline='') as f:
+        rows = list(csv.reader(f, delimiter=delimiter))
+    meta = rows[:4]
+    hdr_i = next((i for i, r in enumerate(rows) if r and str(r[0]).startswith("SAP-Arbeitsvorgang")), None)
+    if hdr_i is None:
+        print(f"⚠️ {p.name}: kein 'SAP-Arbeitsvorgang' – übersprungen.")
+        continue
+    header = rows[hdr_i]
+    data   = [r + [''] * (len(header) - len(r)) for r in rows[hdr_i+1:]]
+    datasets.append(dict(file=p, meta=meta, header=header, rows=data))
+if not datasets:
+    raise SystemExit("⚠️ Keine verwertbaren CSVs.")
 
-# === Dateien einlesen & puffern ==============================================
-for index, csv_file in enumerate(csv_files):
-    file_path = os.path.join(input_dir, csv_file)
-
-    with open(file_path, encoding=encoding_read, newline='') as f:
-        lines = list(csv.reader(f, delimiter=delimiter))
-
-    meta_lines = lines[:4]
-    sap_data_start = 0
-    local_header = []
-    for i, row in enumerate(lines):
-        if row and str(row[0]).startswith("SAP-Arbeitsvorgang"):
-            local_header = row
-            sap_data_start = i + 1
-            break
-    sap_data = lines[sap_data_start:]
-
-    meta = {r[0]: r[1] for r in meta_lines if len(r) >= 2}
-    material_id = meta.get("Material-Id", "")
-    fertigungsauftrag = meta.get("Fertigungsauftrag", "")
-    msn = meta.get("MSN", "")
-    done_fertigungsauftraege.append(fertigungsauftrag)
-
-    fa_value = f"{fertigungsauftrag}_{material_id}_{msn}_{timestamp}"
-
-    if not first_file_seen:
-        meta_lines_first = meta_lines
-        sap_header = local_header[:]
-        first_file_seen = True
-
-    if index < 3:
-        for row in sap_data:
-            row_pad = row + [''] * (len(local_header) - len(row))
-            staging_rows.append({'row_pad': row_pad, 'file_index': index, 'fa_value': fa_value})
-    else:
-        print(f"⚠️ Mehr als 3 Dateien – '{csv_file}' wird nicht berücksichtigt.")
-
-    os.remove(file_path)
-
-# === Zeitbausteine aggregieren & RAW je Auftrag in Sidecar sammeln ===========
-agg = {}              # merkmal_code -> {'sum': float, 'max': float}
-rows_info = []        # für spätere Ausgabe
-raw_sidecar = {}      # row_key -> { "code": merkmal_code, "raw": {0: val0,1: val1,2: val2} }
-
+sap_header = datasets[0]['header'][:]
 sap_len = len(sap_header)
 
-for item in staging_rows:
-    rp = item['row_pad']
-    idx = item['file_index']
-    code = find_merkmal_code(rp)
-    is_zeit = is_zeitbaustein_row(rp)
-    v_idx = rightmost_numeric_index(rp)
-    raw_val = to_float_or_none(rp[v_idx]) if (is_zeit and v_idx is not None) else None
+# ===== IDs & Metadaten =====
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+h = hashlib.sha256("||".join([d['file'].name for d in datasets]).encode("utf-8")).hexdigest()[:8]
+merge_id = f"{ts}_{h}"
 
-    rows_info.append({
-        'row_pad': rp,
-        'file_index': idx,
-        'fa_value': item['fa_value'],
-        'code': code,
-        'is_zeit': is_zeit,
-        'val_idx': v_idx
-    })
+reconstruct_names = []  # für Unmerge-Dateinamen
+fa_ids = []            # nur Fertigungsauftrag-Nummer (für Anzeige in Spalten)
+done_fa = []
+for ds in datasets:
+    meta_dict = {r[0]: r[1] for r in ds['meta'] if len(r) >= 2}
+    material_id = meta_dict.get("Material-Id", "")
+    fertigungsauftrag = meta_dict.get("Fertigungsauftrag", "")
+    msn = meta_dict.get("MSN", "")
+    done_fa.append(fertigungsauftrag)
+    fa_ids.append(fertigungsauftrag)
+    reconstruct_names.append(f"{fertigungsauftrag}_{material_id}_{msn}_{ts}")
 
-    if is_zeit and code and v_idx is not None:
-        v = raw_val or 0.0
-        agg.setdefault(code, {'sum': 0.0, 'max': 0.0})
-        agg[code]['sum'] += v
-        if v > agg[code]['max']:
-            agg[code]['max'] = v
+# ===== Vereinigung + Aggregation =====
+template_by_key = {}  # key -> exemplarische SAP-Zeile
+present_by_key  = {}  # key -> set({0,1,2})
+agg_by_key      = {}  # key -> {'sum':..., 'max':..., 'is_09xx':bool}
+raw_sidecar     = {}  # key -> {'code':..., 'time_idx':int|None, 'raw':{i:val}, 'present':{i:True}}
 
-        # --- Sidecar: Rohwerte je Auftrag, pro Zeile (Key ohne Zahlenzelle) ---
-        row_key = make_row_key(rp, sap_len)
-        entry = raw_sidecar.setdefault(row_key, {"code": code, "raw": {}})
-        entry["raw"][idx] = v
+for di, ds in enumerate(datasets):
+    for r in ds['rows']:
+        key = make_row_key(r, sap_len) or ("ROW::" + "||".join(norm_text(c) for c in r[:sap_len] if str(c).strip()))
+        template_by_key.setdefault(key, list(r))
+        present_by_key.setdefault(key, set()).add(di)
+        if is_zeitbaustein_row(r):
+            code  = find_merkmal_code(r)
+            v_idx = rightmost_time_index(r)
+            if v_idx is not None:
+                v = to_float_or_none(r[v_idx]) or 0.0
+                a = agg_by_key.setdefault(key, {'sum':0.0,'max':0.0,'is_09xx':is_09xx(code)})
+                a['sum'] += v
+                if v > a['max']: a['max'] = v
+                a['is_09xx'] = a['is_09xx'] or is_09xx(code)
+                sc = raw_sidecar.setdefault(key, {"code": code, "time_idx": v_idx, "raw": {}, "present": {}})
+                if sc.get("time_idx") is None: sc["time_idx"] = v_idx
+                sc["raw"][di] = v
 
-# === Header (ohne neue sichtbare Spalten!) ===================================
+# ===== Virtuelle Zeilen (eine pro key) =====
 extra_cols = [
-    "Fertigungsauftrag_1", "Fertigungsauftrag_2", "Fertigungsauftrag_3",
-    "OriginalSAP_Fertigungsauftrag_1", "OriginalSAP_Fertigungsauftrag_2", "OriginalSAP_Fertigungsauftrag_3"
+    "Fertigungsauftrag_1","Fertigungsauftrag_2","Fertigungsauftrag_3",
+    "OriginalSAP_Fertigungsauftrag_1","OriginalSAP_Fertigungsauftrag_2","OriginalSAP_Fertigungsauftrag_3"
 ]
 final_header = sap_header + extra_cols
+virtual_rows = []
 
-# === Finale Zeilen schreiben ==================================================
-for info in rows_info:
-    rp = info['row_pad']
-    idx = info['file_index']
-    fa_value = info['fa_value']
-
-    # ZEITBAUSTEIN: Aggregat sichtbar machen (Summe vs. Max)
-    if info['is_zeit'] and info['code'] and info['val_idx'] is not None:
-        a = agg.get(info['code'])
+for key, tmpl in template_by_key.items():
+    row = list(tmpl)
+    # ZEITBAUSTEIN aggregiert einsetzen
+    if is_zeitbaustein_row(row):
+        a = agg_by_key.get(key)
         if a:
-            repl_val = a['max'] if is_09xx(info['code']) else a['sum']
-            rp[info['val_idx']] = str(int(repl_val)) if float(repl_val).is_integer() else str(repl_val)
+            v_idx = raw_sidecar.get(key, {}).get("time_idx", rightmost_time_index(row))
+            if v_idx is not None:
+                repl = a['max'] if a['is_09xx'] else a['sum']
+                row[v_idx] = str(int(repl)) if float(repl).is_integer() else str(repl)
 
-    # Zusatzspalten füllen
-    fert_col = ["", "", ""]
-    sap_col  = ["", "", ""]
-    fert_col[idx] = fa_value
-    sap_col[idx]  = rp[0] if rp else ""
+    # FA-Spalten: pro Zeile nur dort füllen, wo die Zeile im jeweiligen Auftrag vorkam
+    fert_col = ["","",""]
+    sap_col  = ["","",""]   # ungenutzt → leer lassen
+    prs = present_by_key.get(key, set())
+    for i in range(min(3, len(fa_ids))):
+        if i in prs:
+            fert_col[i] = fa_ids[i]
 
-    all_rows.append(rp + fert_col + sap_col)
+    virtual_rows.append(row + fert_col + sap_col)
 
-# === Ausgeben ================================================================
-output_filename = csv_files[0]
-output_path = os.path.join(output_dir, output_filename)
-
-with open(output_path, mode='w', encoding=encoding_write, newline='') as f:
+# ===== Schreiben =====
+output_filename = datasets[0]['file'].name  # Name der 1. CSV
+output_path = output_dir / output_filename
+with open(output_path, "w", encoding=encoding_write, newline="") as f:
     w = csv.writer(f, delimiter=delimiter)
-    for meta in meta_lines_first:
-        w.writerow(meta + [""] * (len(final_header) - len(meta)))
+    for m in datasets[0]['meta']:
+        w.writerow(m + [""] * (len(final_header) - len(m)))
     w.writerow(final_header)
-    w.writerows(all_rows)
+    w.writerows(virtual_rows)
 
-# done.txt
-with open(done_file_path, 'w', encoding='utf-8') as f:
-    f.write("\n".join(done_fertigungsauftraege))
+with open(done_file, "w", encoding="utf-8") as df:
+    df.write("\n".join(done_fa))
 
-# --- Sidecar speichern (unsichtbar fürs PPS) ---------------------------------
-sidecar_path = os.path.join(temp_dir, f"rawstore_{output_filename}.json")
+# Sidecar fertigstellen
+for key, prs in present_by_key.items():
+    entry = raw_sidecar.setdefault(key, {"code": None, "time_idx": None, "raw": {}, "present": {}})
+    for i in prs:
+        entry["present"][i] = True
+
+payload = {
+    "merge_id": merge_id,
+    "created": ts,
+    "output_file": output_filename,
+    "sap_header_len": sap_len,
+    "reconstruct_names": reconstruct_names,
+    "fa_ids": fa_ids,  # rein informativ
+    "data": raw_sidecar
+}
+sidecar_name = f"rawstore_{output_filename}__{merge_id}.json"
+sidecar_path = temp_dir / sidecar_name
 with open(sidecar_path, "w", encoding="utf-8") as jf:
-    json.dump({
-        "created": timestamp,
-        "output_file": output_filename,
-        "sap_header_len": sap_len,
-        "data": raw_sidecar
-    }, jf, ensure_ascii=False)
+    json.dump(payload, jf, ensure_ascii=False)
 
-print(f"✅ Zusammengeführt in: {output_path}")
 print(f"🧩 Sidecar gespeichert: {sidecar_path}")
-print(f"🧹 Quell-Dateien gelöscht.")
-print(f"📄 done.txt geschrieben mit {len(done_fertigungsauftraege)} Aufträgen.")
+
+# Quellen löschen
+for ds in datasets:
+    try: os.remove(ds['file'])
+    except Exception: pass
+
+print(f"✅ Virtuelle CSV erstellt: {output_path}  (Zeilen: {len(virtual_rows)})")
